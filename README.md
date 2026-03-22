@@ -1,6 +1,12 @@
 # LitPilot
 
-> 基于 PubMed 的文献筛选与 AI 分析工具
+👉 下载地址（Windows EXE）：  
+https://github.com/AlexeusO-O/LitPilot/releases
+
+---
+
+📌 基于 PubMed 的文献筛选与 AI 分析工具  
+适用于医学科研 / 文献阅读 / 系统综述前期筛选
 
 ---
 
