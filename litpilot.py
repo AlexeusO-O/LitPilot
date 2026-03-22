@@ -97,18 +97,30 @@ def score_row(row, core_keywords, target_types, recent_bonus_year=None):
     abstract = (row.get("Abstract","") or "").lower()
     article_type = (row.get("ArticleType","") or "").lower()
     year = extract_year_num(row.get("Year",""))
+
     for kw in core_keywords:
         kw = kw.strip().lower()
-        if not kw: continue
-        if kw in title: score += 3
-        if kw in abstract: score += 2
+        if not kw:
+            continue
+        if kw in title:
+            score += 3
+        if kw in abstract:
+            score += 1
+
     for t in target_types:
         t = t.strip().lower()
-        if t and t in article_type: score += 4
-    if recent_bonus_year and year and year >= recent_bonus_year: score += 2
-    if row.get("Q区","") == "Q1": score += 2
-    elif row.get("Q区","") == "Q2": score += 1
-    if row.get("是否重复","") == "是": score -= 5
+        if t and t in article_type:
+            score += 2
+
+    if recent_bonus_year and year and year >= recent_bonus_year:
+        score += 1
+
+    if row.get("Q区","") == "Q1":
+        score += 1
+
+    if row.get("是否重复","") == "是":
+        score -= 10
+
     return score
 
 def search_pubmed(query, email, retmax, sort_ui):
@@ -446,6 +458,9 @@ class App(tk.Tk):
         ttk.Radiobutton(top,text="PMID 列表导入",variable=self.mode_var,value="pmid").grid(row=0,column=5)
         ttk.Button(top,text="开始抓取",command=self.fetch_records).grid(row=0,column=6,padx=(18,6))
         ttk.Button(top,text="设置",command=self.open_settings).grid(row=0,column=7)
+        self.append_mode_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="追加到当前结果", variable=self.append_mode_var).grid(row=0, column=8, padx=(8, 0))
+        ttk.Button(top, text="清空结果", command=self.clear_all_rows).grid(row=0, column=9, padx=6)
         ttk.Label(top,text="检索式 / PMID").grid(row=1,column=0,sticky="nw",pady=(10,0))
         self.query_text = tk.Text(top,height=4,wrap="word"); self.query_text.grid(row=1,column=1,columnspan=7,sticky="ew",pady=(10,0),padx=6)
         top.columnconfigure(7, weight=1)
@@ -613,6 +628,12 @@ class App(tk.Tk):
         if self.settings.get("auto_score",True): self.run_scoring()
         self.apply_filters()
 
+    def clear_all_rows(self):
+        self.rows = []
+        self.filtered_indices = []
+        self.refresh_tree()
+        self.set_status("已清空当前结果。")
+
     def fetch_records(self):
         email = self.settings.get("email","").strip()
         if not email:
@@ -630,10 +651,20 @@ class App(tk.Tk):
                 pmids = split_pmids(raw)
             if not pmids:
                 messagebox.showinfo("结果","没有抓到文献。"); return
-            self.set_status(f"正在抓取 {len(pmids)} 条记录..."); self.rows = medline_batch_fetch(pmids, email)
+            self.set_status(f"正在抓取 {len(pmids)} 条记录...")
+            new_rows = medline_batch_fetch(pmids, email)
             if self.settings.get("auto_type",True):
-                for row in self.rows: row["ArticleType"] = article_type_from_row(row)
-            if self.settings.get("auto_dedupe",True): self.run_dedup()
+                for row in new_rows:
+                    row["ArticleType"] = article_type_from_row(row)
+
+            append_mode = self.append_mode_var.get() if hasattr(self, "append_mode_var") else True
+            if append_mode:
+                self.rows.extend(new_rows)
+            else:
+                self.rows = new_rows
+
+            if self.settings.get("auto_dedupe",True):
+                self.run_dedup()
             if self.settings.get("easy_enable",False):
                 self.enrich_journals(auto=True)
             else:
@@ -852,7 +883,7 @@ class App(tk.Tk):
         indices = self.get_selected_indices()
         if not indices:
             messagebox.showinfo("提示","请先选中文献。"); return
-        menu = tk.Toplevel(self); menu.title("选择纳排理由"); menu.geometry("380x320")
+        menu = tk.Toplevel(self); menu.title(f"{APP_NAME} - 选择纳排理由"); menu.geometry("380x320")
         vars_ = []; frm = ttk.Frame(menu,padding=12); frm.pack(fill="both",expand=True)
         for reason in EXCLUSION_REASONS:
             v = tk.BooleanVar(value=False); vars_.append((reason,v)); ttk.Checkbutton(frm,text=reason,variable=v).pack(anchor="w")
@@ -870,21 +901,21 @@ class App(tk.Tk):
     def export_all_csv(self):
         if not self.rows:
             messagebox.showinfo("提示","当前没有数据可导出。"); return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",filetypes=[("CSV 文件","*.csv")],initialfile="pubmed_v33_all.csv")
+        path = filedialog.asksaveasfilename(defaultextension=".csv",filetypes=[("CSV 文件","*.csv")],initialfile="litpilot_all.csv")
         if path: write_csv(path,self.rows); messagebox.showinfo("完成","已导出全部 CSV。")
 
     def export_kept_csv(self):
         kept = [r for r in self.rows if r.get("Decision") == "保留"]
         if not kept:
             messagebox.showinfo("提示","当前没有“保留”文献。"); return
-        path = filedialog.asksaveasfilename(defaultextension=".csv",filetypes=[("CSV 文件","*.csv")],initialfile="pubmed_v33_kept.csv")
+        path = filedialog.asksaveasfilename(defaultextension=".csv",filetypes=[("CSV 文件","*.csv")],initialfile="litpilot_kept.csv")
         if path: write_csv(path,kept); messagebox.showinfo("完成","已导出保留项 CSV。")
 
     def export_kept_ris(self):
         kept = [r for r in self.rows if r.get("Decision") == "保留"]
         if not kept:
             messagebox.showinfo("提示","当前没有“保留”文献。"); return
-        path = filedialog.asksaveasfilename(defaultextension=".ris",filetypes=[("RIS 文件","*.ris")],initialfile="pubmed_v33_kept.ris")
+        path = filedialog.asksaveasfilename(defaultextension=".ris",filetypes=[("RIS 文件","*.ris")],initialfile="litpilot_kept.ris")
         if path:
             with open(path,"w",encoding="utf-8") as f: f.write(rows_to_ris(kept))
             messagebox.showinfo("完成","已导出保留项 RIS。")
