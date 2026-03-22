@@ -9,9 +9,11 @@ import tkinter.simpledialog as simpledialog
 import requests
 from Bio import Entrez, Medline
 
-APP_TITLE = "PubMed 筛选助手 v3.3（桌面版）"
-SETTINGS_FILE = "pubmed_v33_settings.json"
-TEMPLATES_FILE = "pubmed_v33_templates.json"
+APP_NAME = "LitPilot"
+APP_VERSION = "v0.1"
+APP_TITLE = f"{APP_NAME} {APP_VERSION}｜PubMed 文献筛选与分析工具"
+SETTINGS_FILE = "litpilot_settings.json"
+TEMPLATES_FILE = "litpilot_templates.json"
 
 PUBMED_SORT_MAP = {
     "最佳匹配 Best Match": "relevance",
@@ -174,7 +176,7 @@ def truncate_abstract(text, mode):
 class SettingsWindow(tk.Toplevel):
     def __init__(self, master, settings, save_callback, test_callback):
         super().__init__(master)
-        self.title("设置"); self.geometry("860x700"); self.resizable(False, False)
+        self.title(f"{APP_NAME} 设置"); self.geometry("860x700"); self.resizable(False, False)
         self.save_callback = save_callback; self.test_callback = test_callback
         frm = ttk.Frame(self, padding=14); frm.pack(fill="both", expand=True)
         ttk.Label(frm,text="NCBI / PubMed",font=("",10,"bold")).grid(row=0,column=0,sticky="w",columnspan=4)
@@ -241,7 +243,7 @@ class SettingsWindow(tk.Toplevel):
 class GPTAnalysisWindow(tk.Toplevel):
     def __init__(self, master, selected_rows, query_text, settings):
         super().__init__(master)
-        self.title("生成选中文献分析文本"); self.geometry("1100x780")
+        self.title(f"{APP_NAME} - 文献分析"); self.geometry("1100x780")
         self.selected_rows = selected_rows; self.query_text = query_text.strip(); self.settings = settings
         frm = ttk.Frame(self,padding=12); frm.pack(fill="both", expand=True)
         ttk.Label(frm,text="自定义任务（可编辑）",font=("",10,"bold")).pack(anchor="w")
@@ -296,7 +298,7 @@ class GPTAnalysisWindow(tk.Toplevel):
 class StatsWindow(tk.Toplevel):
     def __init__(self, master, rows, apply_type_filter, apply_q_filter):
         super().__init__(master)
-        self.title("分类统计"); self.geometry("760x560")
+        self.title(f"{APP_NAME} - 分类统计"); self.geometry("760x560")
         frm = ttk.Frame(self,padding=12); frm.pack(fill="both",expand=True)
         left = ttk.LabelFrame(frm,text="文章类型分布（点击筛选）",padding=10); left.pack(side="left",fill="both",expand=True,padx=(0,8))
         right = ttk.LabelFrame(frm,text="Q区分布（点击筛选）",padding=10); right.pack(side="left",fill="both",expand=True,padx=(8,0))
@@ -315,7 +317,7 @@ class StatsWindow(tk.Toplevel):
 class DetailWindow(tk.Toplevel):
     def __init__(self, master, row_data, save_callback):
         super().__init__(master)
-        self.title("文献详情"); self.geometry("1120x760"); self.row_data = row_data; self.save_callback = save_callback
+        self.title(f"{APP_NAME} - 文献详情"); self.geometry("1120x760"); self.row_data = row_data; self.save_callback = save_callback
         top = ttk.Frame(self,padding=10); top.pack(fill="both",expand=True)
         meta = ttk.Frame(top); meta.pack(fill="x")
         meta_items = [("PMID",row_data.get("PMID","")),("发表时间",row_data.get("Year","")),("期刊",row_data.get("Journal","")),("DOI",row_data.get("DOI","")),("文章类型",row_data.get("ArticleType","")),("相关性评分",str(row_data.get("相关性评分",""))),("Q区",row_data.get("Q区","")),("影响因子",str(row_data.get("影响因子",""))),("中科院分区",row_data.get("中科院分区","")),("是否重复",row_data.get("是否重复",""))]
