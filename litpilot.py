@@ -10,7 +10,7 @@ import requests
 from Bio import Entrez, Medline
 
 APP_NAME = "LitPilot"
-APP_VERSION = "v0.1"
+APP_VERSION = "v0.2"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}｜PubMed 文献筛选与分析工具"
 SETTINGS_FILE = "litpilot_settings.json"
 TEMPLATES_FILE = "litpilot_templates.json"
