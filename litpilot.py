@@ -14,6 +14,8 @@ APP_VERSION = "v0.1"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}｜PubMed 文献筛选与分析工具"
 SETTINGS_FILE = "litpilot_settings.json"
 TEMPLATES_FILE = "litpilot_templates.json"
+WORKSPACE_FILE_EXT = ".litpilot.json"
+JOURNAL_CACHE_FILE = "litpilot_journal_cache.json"
 
 PUBMED_SORT_MAP = {
     "最佳匹配 Best Match": "relevance",
@@ -185,6 +187,55 @@ def truncate_abstract(text, mode):
     if mode == "不包含摘要": return ""
     return text
 
+
+def has_missing_journal_info(row):
+    return (not row.get("Q区","")) or (not row.get("影响因子","")) or (not row.get("中科院分区",""))
+
+
+class JournalQueryModeWindow(tk.Toplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title(f"{APP_NAME} - 查询期刊信息")
+        self.geometry("520x270")
+        self.resizable(False, False)
+        self.result = None
+        self.var = tk.StringVar(value="missing_all")
+
+        frm = ttk.Frame(self, padding=14)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="请选择期刊信息查询范围", font=("", 10, "bold")).pack(anchor="w", pady=(0, 10))
+
+        options = [
+            ("查询全部结果中的缺失项（推荐）", "missing_all"),
+            ("查询全部结果中的全部期刊（强制刷新）", "all_all"),
+            ("仅查询当前筛选结果中的缺失项", "missing_filtered"),
+            ("仅查询当前筛选结果中的全部期刊（强制刷新）", "all_filtered"),
+        ]
+        for label, value in options:
+            ttk.Radiobutton(frm, text=label, value=value, variable=self.var).pack(anchor="w", pady=4)
+
+        tip = "说明：缺失项模式会优先使用本地缓存；全部模式会重新请求 EasyScholar。"
+        ttk.Label(frm, text=tip, foreground="#666666", wraplength=470).pack(anchor="w", pady=(12, 0))
+
+        btns = ttk.Frame(frm)
+        btns.pack(side="bottom", anchor="e", pady=(18, 0))
+        ttk.Button(btns, text="确定", command=self.ok).pack(side="right")
+        ttk.Button(btns, text="取消", command=self.cancel).pack(side="right", padx=8)
+
+        self.transient(master)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.wait_visibility()
+        self.focus_set()
+
+    def ok(self):
+        self.result = self.var.get()
+        self.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.destroy()
+
 class SettingsWindow(tk.Toplevel):
     def __init__(self, master, settings, save_callback, test_callback):
         super().__init__(master)
@@ -226,6 +277,10 @@ class SettingsWindow(tk.Toplevel):
             var = tk.StringVar(value=keys.get(name,DEFAULT_SHORTCUTS[name])); self.shortcut_vars[name]=var
             ttk.Entry(frm,textvariable=var,width=14).grid(row=row,column=1,sticky="w",padx=6,pady=(6,0))
             row += 1
+        ttk.Label(frm,text="退出提醒",font=("",10,"bold")).grid(row=row,column=0,sticky="w",columnspan=4,pady=(18,0)); row += 1
+        self.remind_save_workspace_var = tk.BooleanVar(value=settings.get("remind_save_workspace_on_exit", True))
+        ttk.Checkbutton(frm,text="关闭软件前提醒保存工作区",variable=self.remind_save_workspace_var).grid(row=row,column=0,columnspan=3,sticky="w",pady=(8,0)); row += 1
+
         ttk.Label(frm,text="GPT 分析设置",font=("",10,"bold")).grid(row=row,column=0,sticky="w",columnspan=4,pady=(18,0)); row += 1
         ttk.Label(frm,text="摘要长度").grid(row=row,column=0,sticky="w",pady=(8,0))
         self.abstract_len_var = tk.StringVar(value=settings.get("gpt_abstract_mode","前300字"))
@@ -249,6 +304,7 @@ class SettingsWindow(tk.Toplevel):
             "auto_score": self.auto_score_var.get(),
             "apply_template_count": self.template_apply_count_var.get(),
             "shortcuts": {k:v.get().strip() for k,v in self.shortcut_vars.items()},
+            "remind_save_workspace_on_exit": self.remind_save_workspace_var.get(),
             "gpt_abstract_mode": self.abstract_len_var.get().strip(),
         }); self.destroy()
 
@@ -372,9 +428,11 @@ class App(tk.Tk):
         super().__init__()
         self.title(APP_TITLE); self.geometry("1760x980")
         self.rows = []; self.filtered_indices = []; self.settings = self.load_json(SETTINGS_FILE,{})
+        self.journal_cache = self.load_json(JOURNAL_CACHE_FILE,{})
+        self.workspace_dirty = False
         self.templates = self.load_templates(); self.current_sort_column = "相关性评分"; self.current_sort_desc = True
-        self.tree_tags_configured = False; self.advanced_visible = False
-        self._build_ui(); self.apply_loaded_settings(); self.refresh_template_dropdown(); self.bind_shortcuts()
+        self.tree_tags_configured = False; self.advanced_visible = False; self.filter_panel_visible = False; self.tools_panel_visible = False
+        self._build_ui(); self.create_menus(); self.apply_loaded_settings(); self.refresh_template_dropdown(); self.bind_shortcuts(); self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def load_json(self, path, default):
         if os.path.exists(path):
@@ -385,6 +443,9 @@ class App(tk.Tk):
 
     def save_json(self, path, data):
         with open(path,"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
+
+    def save_journal_cache(self):
+        self.save_json(JOURNAL_CACHE_FILE, self.journal_cache)
 
     def load_templates(self):
         data = self.load_json(TEMPLATES_FILE,{})
@@ -445,6 +506,27 @@ class App(tk.Tk):
         }
         self.settings.update(data); self.save_json(SETTINGS_FILE,self.settings)
 
+    def create_menus(self):
+        menubar = tk.Menu(self)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="保存工作区", command=self.save_workspace)
+        file_menu.add_command(label="加载工作区", command=self.load_workspace)
+        file_menu.add_separator()
+        file_menu.add_command(label="导出保留 CSV", command=self.export_kept_csv)
+        file_menu.add_command(label="导出保留 RIS", command=self.export_kept_ris)
+        file_menu.add_command(label="导出全部 CSV", command=self.export_all_csv)
+        file_menu.add_command(label="导出核心文献包", command=self.export_core_bundle)
+        file_menu.add_separator()
+        file_menu.add_command(label="退出", command=self.on_close)
+        menubar.add_cascade(label="文件", menu=file_menu)
+
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        settings_menu.add_command(label="打开设置", command=self.open_settings)
+        menubar.add_cascade(label="设置", menu=settings_menu)
+
+        self.config(menu=menubar)
+
     def _build_ui(self):
         top = ttk.Frame(self,padding=10); top.pack(fill="x")
         ttk.Label(top,text="抓取条数").grid(row=0,column=0,sticky="w")
@@ -456,28 +538,69 @@ class App(tk.Tk):
         self.mode_var = tk.StringVar(value="search")
         ttk.Radiobutton(top,text="PubMed 检索",variable=self.mode_var,value="search").grid(row=0,column=4,padx=(18,4))
         ttk.Radiobutton(top,text="PMID 列表导入",variable=self.mode_var,value="pmid").grid(row=0,column=5)
-        ttk.Button(top,text="开始抓取",command=self.fetch_records).grid(row=0,column=6,padx=(18,6))
-        ttk.Button(top,text="设置",command=self.open_settings).grid(row=0,column=7)
         self.append_mode_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text="追加到当前结果", variable=self.append_mode_var).grid(row=0, column=8, padx=(8, 0))
-        ttk.Button(top, text="清空结果", command=self.clear_all_rows).grid(row=0, column=9, padx=6)
-        ttk.Label(top,text="检索式 / PMID").grid(row=1,column=0,sticky="nw",pady=(10,0))
-        self.query_text = tk.Text(top,height=4,wrap="word"); self.query_text.grid(row=1,column=1,columnspan=7,sticky="ew",pady=(10,0),padx=6)
-        top.columnconfigure(7, weight=1)
+        ttk.Checkbutton(top, text="追加到当前结果", variable=self.append_mode_var).grid(row=0, column=6, padx=(18, 0))
 
-        tools = ttk.LabelFrame(self,text="模板与分析参数",padding=10); tools.pack(fill="x",padx=10,pady=(0,10))
-        ttk.Label(tools,text="筛选策略").grid(row=0,column=0,sticky="w")
+        ttk.Label(top,text="检索式 / PMID").grid(row=1,column=0,sticky="nw",pady=(10,0))
+        self.query_text = tk.Text(top,height=4,wrap="word")
+        self.query_text.grid(row=1,column=1,columnspan=6,sticky="ew",pady=(10,0),padx=6)
+        top.columnconfigure(6, weight=1)
+
+        # 主操作条：当前主页外露按钮统一到一行
+        action_bar = ttk.Frame(self,padding=(10,6,10,0)); action_bar.pack(fill="x")
+        ttk.Button(action_bar,text="标记保留",command=lambda: self.quick_set_decision("保留")).pack(side="left")
+        ttk.Button(action_bar,text="标记排除",command=lambda: self.quick_set_decision("排除")).pack(side="left",padx=6)
+        ttk.Button(action_bar,text="标记待定",command=lambda: self.quick_set_decision("待定")).pack(side="left",padx=6)
+        self.filter_toggle_btn = ttk.Button(action_bar,text="▼ 筛选",command=self.toggle_filter_panel)
+        self.filter_toggle_btn.pack(side="left",padx=(18,6))
+        self.tools_toggle_btn = ttk.Button(action_bar,text="▼ 工具",command=self.toggle_tools_panel)
+        self.tools_toggle_btn.pack(side="left",padx=6)
+        ttk.Button(action_bar,text="清空结果",command=self.clear_all_rows,width=10).pack(side="right", padx=(0,8))
+        ttk.Button(action_bar,text="🚀 开始抓取",command=self.fetch_records,width=18).pack(side="right", padx=(0,10))
+
+        # 折叠面板容器
+        self.panel_host = ttk.Frame(self)
+
+        # 筛选折叠面板
+        self.filter_panel = ttk.LabelFrame(self.panel_host,text="筛选",padding=10)
+
+        filter_line1 = ttk.Frame(self.filter_panel); filter_line1.pack(fill="x")
+        ttk.Label(filter_line1,text="标题关键词").grid(row=0,column=0,sticky="w")
+        self.title_kw_var = tk.StringVar(); ttk.Entry(filter_line1,textvariable=self.title_kw_var,width=18).grid(row=0,column=1,padx=6)
+        ttk.Label(filter_line1,text="摘要关键词").grid(row=0,column=2,sticky="w",padx=(10,0))
+        self.abstract_kw_var = tk.StringVar(); ttk.Entry(filter_line1,textvariable=self.abstract_kw_var,width=22).grid(row=0,column=3,padx=6)
+        ttk.Label(filter_line1,text="最早年份").grid(row=0,column=4,sticky="w",padx=(10,0))
+        self.year_min_var = tk.StringVar(); ttk.Entry(filter_line1,textvariable=self.year_min_var,width=8).grid(row=0,column=5,padx=6)
+        ttk.Label(filter_line1,text="最晚年份").grid(row=0,column=6,sticky="w",padx=(10,0))
+        self.year_max_var = tk.StringVar(); ttk.Entry(filter_line1,textvariable=self.year_max_var,width=8).grid(row=0,column=7,padx=6)
+        ttk.Label(filter_line1,text="筛选结果").grid(row=0,column=8,sticky="w",padx=(10,0))
+        self.decision_filter_var = tk.StringVar(value="全部")
+        ttk.Combobox(filter_line1,textvariable=self.decision_filter_var,values=["全部","待定","保留","排除"],state="readonly",width=10).grid(row=0,column=9,padx=6)
+        ttk.Label(filter_line1,text="文章类型").grid(row=0,column=10,sticky="w",padx=(10,0))
+        self.type_filter_var = tk.StringVar(value=""); ttk.Entry(filter_line1,textvariable=self.type_filter_var,width=16).grid(row=0,column=11,padx=6)
+        ttk.Label(filter_line1,text="Q区").grid(row=0,column=12,sticky="w",padx=(10,0))
+        self.q_filter_var = tk.StringVar(value="全部")
+        ttk.Combobox(filter_line1,textvariable=self.q_filter_var,values=["全部","Q1","Q2","Q3","Q4"],state="readonly",width=8).grid(row=0,column=13,padx=6)
+        self.nondup_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(filter_line1,text="仅看非重复",variable=self.nondup_only_var).grid(row=0,column=14,padx=(12,0))
+
+        filter_line2 = ttk.Frame(self.filter_panel); filter_line2.pack(fill="x", pady=(10,0))
+        ttk.Button(filter_line2,text="最近1年",command=lambda: self.quick_year_range(1)).pack(side="left")
+        ttk.Button(filter_line2,text="最近3年",command=lambda: self.quick_year_range(3)).pack(side="left",padx=6)
+        ttk.Button(filter_line2,text="最近5年",command=lambda: self.quick_year_range(5)).pack(side="left",padx=6)
+        ttk.Button(filter_line2,text="清空年份",command=self.clear_year_range).pack(side="left",padx=6)
+
+        template_frame = ttk.LabelFrame(self.filter_panel,text="模板",padding=8); template_frame.pack(fill="x",pady=(10,0))
+        ttk.Label(template_frame,text="筛选策略").pack(side="left")
         self.current_template_var = tk.StringVar(value="默认")
-        self.template_combo = ttk.Combobox(tools,textvariable=self.current_template_var,state="readonly",width=20)
-        self.template_combo.grid(row=0,column=1,sticky="w",padx=6)
-        ttk.Button(tools,text="应用策略",command=self.apply_template).grid(row=0,column=2,sticky="w",padx=6)
-        ttk.Button(tools,text="保存当前为策略",command=self.save_template_prompt).grid(row=0,column=3,sticky="w",padx=6)
-        ttk.Button(tools,text="重新查询期刊信息",command=self.enrich_journals).grid(row=0,column=4,sticky="w",padx=6)
-        ttk.Button(tools,text="分类统计",command=self.show_stats).grid(row=0,column=5,sticky="w",padx=6)
-        ttk.Button(tools,text="生成选中文献分析文本",command=self.open_gpt_analysis).grid(row=0,column=6,sticky="w",padx=6)
-        self.advanced_toggle_btn = ttk.Button(tools,text="▼ 高级筛选",command=self.toggle_advanced)
-        self.advanced_toggle_btn.grid(row=1,column=0,sticky="w",pady=(10,0))
-        self.advanced_frame = ttk.Frame(tools); self.advanced_frame.grid(row=2,column=0,columnspan=7,sticky="ew",pady=(10,0)); self.advanced_frame.grid_remove()
+        self.template_combo = ttk.Combobox(template_frame,textvariable=self.current_template_var,state="readonly",width=20)
+        self.template_combo.pack(side="left",padx=6)
+        ttk.Button(template_frame,text="应用策略",command=self.apply_template).pack(side="left",padx=6)
+        ttk.Button(template_frame,text="保存当前为策略",command=self.save_template_prompt).pack(side="left",padx=6)
+        self.advanced_toggle_btn = ttk.Button(template_frame,text="▼ 高级筛选",command=self.toggle_advanced)
+        self.advanced_toggle_btn.pack(side="left",padx=(18,0))
+
+        self.advanced_frame = ttk.Frame(self.filter_panel)
         columns_frame = ttk.Frame(self.advanced_frame); columns_frame.pack(fill="x")
         columns_frame.columnconfigure(0,weight=1); columns_frame.columnconfigure(1,weight=1); columns_frame.columnconfigure(2,weight=1)
         col1 = ttk.Frame(columns_frame); col1.grid(row=0,column=0,sticky="nsew",padx=(0,8))
@@ -492,43 +615,19 @@ class App(tk.Tk):
             var = tk.BooleanVar(value=False); self.target_type_vars[name] = var
             ttk.Checkbutton(col3,text=name,variable=var).grid(row=i//2,column=i%2,sticky="w",padx=4,pady=2)
 
-        btns = ttk.Frame(self,padding=(10,0)); btns.pack(fill="x")
-        ttk.Button(btns,text="应用过滤",command=self.apply_filters).pack(side="left")
-        ttk.Button(btns,text="清空过滤",command=self.clear_filters).pack(side="left",padx=6)
-        ttk.Button(btns,text="最近1年",command=lambda: self.quick_year_range(1)).pack(side="left",padx=(12,0))
-        ttk.Button(btns,text="最近3年",command=lambda: self.quick_year_range(3)).pack(side="left",padx=6)
-        ttk.Button(btns,text="最近5年",command=lambda: self.quick_year_range(5)).pack(side="left",padx=6)
-        ttk.Button(btns,text="清空年份",command=self.clear_year_range).pack(side="left",padx=6)
-        ttk.Button(btns,text="查看/编辑选中文献",command=self.open_selected_detail).pack(side="left",padx=18)
-        ttk.Button(btns,text="批量打标签",command=self.batch_tag).pack(side="left",padx=6)
-        ttk.Button(btns,text="一键生成纳排理由",command=self.auto_reason_selected).pack(side="left",padx=6)
-        ttk.Button(btns,text="标记保留",command=lambda: self.quick_set_decision("保留")).pack(side="left",padx=12)
-        ttk.Button(btns,text="标记排除",command=lambda: self.quick_set_decision("排除")).pack(side="left",padx=6)
-        ttk.Button(btns,text="标记待定",command=lambda: self.quick_set_decision("待定")).pack(side="left",padx=6)
-        ttk.Button(btns,text="导出核心文献包",command=self.export_core_bundle).pack(side="right")
-        ttk.Button(btns,text="导出全部 CSV",command=self.export_all_csv).pack(side="right",padx=6)
-        ttk.Button(btns,text="导出保留 RIS",command=self.export_kept_ris).pack(side="right",padx=6)
-        ttk.Button(btns,text="导出保留 CSV",command=self.export_kept_csv).pack(side="right",padx=6)
+        filter_line3 = ttk.Frame(self.filter_panel); filter_line3.pack(fill="x", pady=(10,0))
+        ttk.Button(filter_line3,text="应用过滤",command=self.apply_filters).pack(side="left")
+        ttk.Button(filter_line3,text="清空过滤",command=self.clear_filters).pack(side="left",padx=6)
 
-        filters = ttk.LabelFrame(self,text="过滤",padding=10); filters.pack(fill="x",padx=10,pady=10)
-        ttk.Label(filters,text="标题关键词").grid(row=0,column=0,sticky="w")
-        self.title_kw_var = tk.StringVar(); ttk.Entry(filters,textvariable=self.title_kw_var,width=18).grid(row=0,column=1,padx=6)
-        ttk.Label(filters,text="摘要关键词").grid(row=0,column=2,sticky="w",padx=(10,0))
-        self.abstract_kw_var = tk.StringVar(); ttk.Entry(filters,textvariable=self.abstract_kw_var,width=22).grid(row=0,column=3,padx=6)
-        ttk.Label(filters,text="最早年份").grid(row=0,column=4,sticky="w",padx=(10,0))
-        self.year_min_var = tk.StringVar(); ttk.Entry(filters,textvariable=self.year_min_var,width=8).grid(row=0,column=5,padx=6)
-        ttk.Label(filters,text="最晚年份").grid(row=0,column=6,sticky="w",padx=(10,0))
-        self.year_max_var = tk.StringVar(); ttk.Entry(filters,textvariable=self.year_max_var,width=8).grid(row=0,column=7,padx=6)
-        ttk.Label(filters,text="筛选结果").grid(row=0,column=8,sticky="w",padx=(10,0))
-        self.decision_filter_var = tk.StringVar(value="全部")
-        ttk.Combobox(filters,textvariable=self.decision_filter_var,values=["全部","待定","保留","排除"],state="readonly",width=10).grid(row=0,column=9,padx=6)
-        ttk.Label(filters,text="文章类型").grid(row=0,column=10,sticky="w",padx=(10,0))
-        self.type_filter_var = tk.StringVar(value=""); ttk.Entry(filters,textvariable=self.type_filter_var,width=16).grid(row=0,column=11,padx=6)
-        ttk.Label(filters,text="Q区").grid(row=0,column=12,sticky="w",padx=(10,0))
-        self.q_filter_var = tk.StringVar(value="全部")
-        ttk.Combobox(filters,textvariable=self.q_filter_var,values=["全部","Q1","Q2","Q3","Q4"],state="readonly",width=8).grid(row=0,column=13,padx=6)
-        self.nondup_only_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(filters,text="仅看非重复",variable=self.nondup_only_var).grid(row=0,column=14,padx=(12,0))
+        # 工具折叠面板
+        self.tools_panel = ttk.LabelFrame(self.panel_host,text="工具",padding=10)
+        tools_inner = ttk.Frame(self.tools_panel); tools_inner.pack(fill="x")
+        ttk.Button(tools_inner,text="重新查询期刊信息",command=self.enrich_journals).grid(row=0,column=0,padx=6,pady=4,sticky="ew")
+        ttk.Button(tools_inner,text="分类统计",command=self.show_stats).grid(row=0,column=1,padx=6,pady=4,sticky="ew")
+        ttk.Button(tools_inner,text="生成分析文本",command=self.open_gpt_analysis).grid(row=1,column=0,padx=6,pady=4,sticky="ew")
+        ttk.Button(tools_inner,text="批量打标签",command=self.batch_tag).grid(row=1,column=1,padx=6,pady=4,sticky="ew")
+        ttk.Button(tools_inner,text="一键生成纳排理由",command=self.auto_reason_selected).grid(row=2,column=0,columnspan=2,padx=6,pady=4,sticky="ew")
+        tools_inner.columnconfigure(0,weight=1); tools_inner.columnconfigure(1,weight=1)
 
         stats = ttk.Frame(self,padding=(10,0)); stats.pack(fill="x")
         self.status_var = tk.StringVar(value="准备就绪"); ttk.Label(stats,textvariable=self.status_var).pack(side="left")
@@ -556,12 +655,149 @@ class App(tk.Tk):
         self.context_menu.add_command(label="复制 DOI",command=lambda: self.copy_selected_field("DOI"))
         self.context_menu.add_command(label="复制标题",command=lambda: self.copy_selected_field("Title"))
 
+    def mark_workspace_dirty(self):
+        self.workspace_dirty = True
+
+    def on_close(self):
+        remind = self.settings.get("remind_save_workspace_on_exit", True)
+        if remind and self.workspace_dirty and self.rows:
+            result = messagebox.askyesnocancel("退出前保存", "当前结果尚未保存为工作区，是否先保存？")
+            if result is None:
+                return
+            if result:
+                self.save_workspace()
+                if self.workspace_dirty:
+                    return
+        self.destroy()
+
+    def collect_workspace_state(self):
+        return {
+            "app_name": APP_NAME,
+            "app_version": APP_VERSION,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "query_text": self.query_text.get("1.0", "end").strip(),
+            "rows": self.rows,
+            "filters": {
+                "title_kw": self.title_kw_var.get(),
+                "abstract_kw": self.abstract_kw_var.get(),
+                "year_min": self.year_min_var.get(),
+                "year_max": self.year_max_var.get(),
+                "decision_filter": self.decision_filter_var.get(),
+                "type_filter": self.type_filter_var.get(),
+                "q_filter": self.q_filter_var.get(),
+                "nondup_only": self.nondup_only_var.get(),
+                "pubmed_sort": self.pubmed_sort_var.get(),
+                "retmax": self.retmax_var.get(),
+                "append_mode": self.append_mode_var.get() if hasattr(self, "append_mode_var") else True,
+                "current_template": self.current_template_var.get() if hasattr(self, "current_template_var") else "默认",
+                "highlight": self.highlight_var.get() if hasattr(self, "highlight_var") else "",
+                "core_keywords": self.core_kw_var.get() if hasattr(self, "core_kw_var") else "",
+                "target_types": self.get_selected_target_types() if hasattr(self, "target_type_vars") else [],
+                "advanced_visible": self.advanced_visible,
+            },
+        }
+
+    def save_workspace(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=WORKSPACE_FILE_EXT,
+            filetypes=[("LitPilot 工作区", f"*{WORKSPACE_FILE_EXT}"), ("JSON 文件", "*.json")],
+            initialfile="litpilot_workspace.litpilot.json"
+        )
+        if not path:
+            return
+        data = self.collect_workspace_state()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        self.workspace_dirty = False
+        self.set_status(f"工作区已保存：{os.path.basename(path)}")
+        messagebox.showinfo("完成", "工作区已保存。")
+
+    def load_workspace(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("LitPilot 工作区", f"*{WORKSPACE_FILE_EXT}"), ("JSON 文件", "*.json")]
+        )
+        if not path:
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.rows = data.get("rows", [])
+        self.filtered_indices = []
+
+        self.query_text.delete("1.0", "end")
+        self.query_text.insert("1.0", data.get("query_text", ""))
+
+        filters = data.get("filters", {})
+        self.title_kw_var.set(filters.get("title_kw", ""))
+        self.abstract_kw_var.set(filters.get("abstract_kw", ""))
+        self.year_min_var.set(filters.get("year_min", ""))
+        self.year_max_var.set(filters.get("year_max", ""))
+        self.decision_filter_var.set(filters.get("decision_filter", "全部"))
+        self.type_filter_var.set(filters.get("type_filter", ""))
+        self.q_filter_var.set(filters.get("q_filter", "全部"))
+        self.nondup_only_var.set(filters.get("nondup_only", False))
+        self.pubmed_sort_var.set(filters.get("pubmed_sort", "最佳匹配 Best Match"))
+        self.retmax_var.set(str(filters.get("retmax", "50")))
+        if hasattr(self, "append_mode_var"):
+            self.append_mode_var.set(filters.get("append_mode", True))
+        if hasattr(self, "current_template_var"):
+            self.current_template_var.set(filters.get("current_template", "默认"))
+        if hasattr(self, "highlight_var"):
+            self.highlight_var.set(filters.get("highlight", ""))
+        if hasattr(self, "core_kw_var"):
+            self.core_kw_var.set(filters.get("core_keywords", ""))
+        if hasattr(self, "target_type_vars"):
+            self.set_selected_target_types(filters.get("target_types", []))
+
+        want_advanced = filters.get("advanced_visible", False)
+        if want_advanced != self.advanced_visible:
+            self.toggle_advanced()
+
+        self.workspace_dirty = False
+        self.apply_filters()
+        self.set_status(f"工作区已加载：{os.path.basename(path)}")
+        messagebox.showinfo("完成", "工作区已加载。")
+
+    def update_panel_host_visibility(self):
+        if self.filter_panel_visible or self.tools_panel_visible:
+            if not self.panel_host.winfo_manager():
+                self.panel_host.pack(fill="x", padx=0, pady=0)
+        else:
+            if self.panel_host.winfo_manager():
+                self.panel_host.pack_forget()
+
+    def toggle_filter_panel(self):
+        self.filter_panel_visible = not self.filter_panel_visible
+        if self.filter_panel_visible:
+            if not self.panel_host.winfo_manager():
+                self.panel_host.pack(fill="x")
+            self.filter_panel.pack(fill="x", padx=10, pady=(0,10))
+            self.filter_toggle_btn.config(text="▲ 筛选")
+        else:
+            self.filter_panel.pack_forget()
+            self.filter_toggle_btn.config(text="▼ 筛选")
+        self.update_panel_host_visibility()
+
+    def toggle_tools_panel(self):
+        self.tools_panel_visible = not self.tools_panel_visible
+        if self.tools_panel_visible:
+            if not self.panel_host.winfo_manager():
+                self.panel_host.pack(fill="x")
+            self.tools_panel.pack(fill="x", padx=10, pady=(0,10))
+            self.tools_toggle_btn.config(text="▲ 工具")
+        else:
+            self.tools_panel.pack_forget()
+            self.tools_toggle_btn.config(text="▼ 工具")
+        self.update_panel_host_visibility()
+
     def toggle_advanced(self):
         self.advanced_visible = not self.advanced_visible
         if self.advanced_visible:
-            self.advanced_frame.grid(); self.advanced_toggle_btn.config(text="▲ 高级筛选")
+            self.advanced_frame.pack(fill="x", pady=(10,0))
+            self.advanced_toggle_btn.config(text="▲ 高级筛选")
         else:
-            self.advanced_frame.grid_remove(); self.advanced_toggle_btn.config(text="▼ 高级筛选")
+            self.advanced_frame.pack_forget()
+            self.advanced_toggle_btn.config(text="▼ 高级筛选")
 
     def quick_year_range(self, years):
         current = time.localtime().tm_year
@@ -632,6 +868,7 @@ class App(tk.Tk):
         self.rows = []
         self.filtered_indices = []
         self.refresh_tree()
+        self.workspace_dirty = False
         self.set_status("已清空当前结果。")
 
     def fetch_records(self):
@@ -662,6 +899,7 @@ class App(tk.Tk):
                 self.rows.extend(new_rows)
             else:
                 self.rows = new_rows
+            self.mark_workspace_dirty()
 
             if self.settings.get("auto_dedupe",True):
                 self.run_dedup()
@@ -704,35 +942,107 @@ class App(tk.Tk):
         except: pass
         return meta
 
+    def choose_journal_query_mode(self):
+        win = JournalQueryModeWindow(self)
+        self.wait_window(win)
+        return win.result
+
+    def apply_journal_meta_to_rows(self, overwrite=False):
+        for row in self.rows:
+            meta = self.journal_cache.get(normalize_journal(row.get("Journal","")))
+            if not meta:
+                continue
+            if overwrite:
+                row["Q区"] = meta.get("Q区","")
+                row["影响因子"] = meta.get("影响因子","")
+                row["中科院分区"] = meta.get("中科院分区","")
+            else:
+                if not row.get("Q区",""):
+                    row["Q区"] = meta.get("Q区","")
+                if not row.get("影响因子",""):
+                    row["影响因子"] = meta.get("影响因子","")
+                if not row.get("中科院分区",""):
+                    row["中科院分区"] = meta.get("中科院分区","")
+
     def enrich_journals(self, auto=False):
         if not self.rows:
-            if not auto: messagebox.showinfo("提示","请先抓取文献。")
+            if not auto:
+                messagebox.showinfo("提示","请先抓取文献。")
             return
-        if not self.settings.get("easy_enable",False):
-            if not auto: messagebox.showinfo("提示","请先在设置中启用 EasyScholar。")
-            return
-        key = self.settings.get("easy_key","").strip(); url = self.settings.get("easy_url","").strip()
+
+        key = self.settings.get("easy_key","").strip()
+        url = self.settings.get("easy_url","").strip()
         if not key or not url:
-            if not auto: messagebox.showerror("提示","请先在设置中填写 EasyScholar URL 和 SecretKey。")
+            if not auto:
+                messagebox.showerror("提示","请先在设置中填写 EasyScholar URL 和 SecretKey。")
             return
+
+        if auto and not self.settings.get("easy_enable", False):
+            return
+
+        mode = "missing_all" if auto else self.choose_journal_query_mode()
+        if not mode:
+            return
+
+        use_filtered = mode.endswith("_filtered")
+        missing_only = mode.startswith("missing")
+        overwrite = not missing_only
+        target_indices = list(self.filtered_indices) if use_filtered else list(range(len(self.rows)))
+
+        if not target_indices:
+            if not auto:
+                messagebox.showinfo("提示","当前没有可查询的目标文献。")
+            return
+
+        journals = {}
+        for idx in target_indices:
+            row = self.rows[idx]
+            journal_name = row.get("Journal","").strip()
+            journal_key = normalize_journal(journal_name)
+            if not journal_key:
+                continue
+            if missing_only and not has_missing_journal_info(row):
+                continue
+            journals.setdefault(journal_key, journal_name)
+
+        if not journals:
+            if not auto:
+                messagebox.showinfo("提示","当前范围内没有需要查询的期刊信息。")
+            return
+
         def work():
             try:
-                self.set_status("正在补充期刊信息...")
-                journals = sorted({normalize_journal(r.get("Journal","")) for r in self.rows if r.get("Journal","").strip()})
-                cache = {}
-                for i,jn in enumerate(journals,1):
-                    original_name = next((r["Journal"] for r in self.rows if normalize_journal(r.get("Journal","")) == jn), "")
+                total = len(journals)
+                done = 0
+                for journal_key, original_name in journals.items():
+                    use_cache = False
+                    cached = self.journal_cache.get(journal_key, {})
+                    if missing_only and cached.get("Q区") and cached.get("影响因子") and cached.get("中科院分区"):
+                        use_cache = True
+
+                    if use_cache:
+                        done += 1
+                        self.set_status(f"期刊信息查询中 {done}/{total}（缓存） 当前期刊：{original_name}")
+                        continue
+
+                    self.set_status(f"期刊信息查询中 {done+1}/{total} 当前期刊：{original_name}")
                     resp = requests.get(url, params={"secretKey": key, "publicationName": original_name}, timeout=15)
-                    cache[jn] = self.parse_easy_result(resp.json())
-                    self.set_status(f"期刊信息查询中 {i}/{len(journals)} ..."); time.sleep(0.7)
-                for row in self.rows:
-                    meta = cache.get(normalize_journal(row.get("Journal","")), {})
-                    row["Q区"] = meta.get("Q区",""); row["影响因子"] = meta.get("影响因子",""); row["中科院分区"] = meta.get("中科院分区","")
-                if self.settings.get("auto_score",True): self.run_scoring()
-                self.apply_filters(); self.set_status(f"已抓取 {len(self.rows)} 条记录。")
+                    self.journal_cache[journal_key] = self.parse_easy_result(resp.json())
+                    self.save_journal_cache()
+                    done += 1
+                    time.sleep(0.7)
+
+                self.apply_journal_meta_to_rows(overwrite=overwrite)
+                if self.settings.get("auto_score", True):
+                    self.run_scoring()
+                self.mark_workspace_dirty()
+                self.apply_filters()
+                self.set_status(f"已更新期刊信息，共处理 {total} 本期刊。")
             except Exception as e:
-                if not auto: messagebox.showerror("EasyScholar 错误", str(e))
+                if not auto:
+                    messagebox.showerror("EasyScholar 错误", str(e))
                 self.set_status("期刊信息查询失败")
+
         threading.Thread(target=work, daemon=True).start()
 
     def apply_filters(self):
@@ -827,6 +1137,7 @@ class App(tk.Tk):
         if not indices: return
         for idx in indices: self.rows[idx]["Decision"] = value
         self.refresh_tree()
+        self.mark_workspace_dirty()
 
     def cycle_decision(self):
         indices = self.get_selected_indices()
@@ -835,6 +1146,7 @@ class App(tk.Tk):
         for idx in indices:
             cur = self.rows[idx].get("Decision","待定"); self.rows[idx]["Decision"] = order.get(cur,"待定")
         self.refresh_tree()
+        self.mark_workspace_dirty()
 
     def open_selected_detail(self):
         indices = self.get_selected_indices()
@@ -846,6 +1158,7 @@ class App(tk.Tk):
             self.rows[idx] = updated
             if self.settings.get("auto_type",True): self.rows[idx]["ArticleType"] = article_type_from_row(self.rows[idx])
             if self.settings.get("auto_score",True): self.run_scoring()
+            self.mark_workspace_dirty()
             self.apply_filters()
         DetailWindow(self, row_data, save_callback)
 
@@ -878,6 +1191,7 @@ class App(tk.Tk):
             old = [x.strip() for x in re.split(r"[,;，；]+", self.rows[idx].get("Tags","")) if x.strip()]
             self.rows[idx]["Tags"] = "; ".join(list(dict.fromkeys(old + tags)))
         self.refresh_tree()
+        self.mark_workspace_dirty()
 
     def auto_reason_selected(self):
         indices = self.get_selected_indices()
@@ -895,7 +1209,7 @@ class App(tk.Tk):
             for idx in indices:
                 self.rows[idx]["Reason"] = text
                 if self.rows[idx].get("Decision","待定") == "待定": self.rows[idx]["Decision"] = "排除"
-            self.refresh_tree(); menu.destroy()
+            self.refresh_tree(); self.mark_workspace_dirty(); menu.destroy()
         ttk.Button(frm,text="应用",command=apply).pack(anchor="e",pady=10)
 
     def export_all_csv(self):
